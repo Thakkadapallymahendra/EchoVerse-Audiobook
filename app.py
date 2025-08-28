@@ -13,10 +13,8 @@ from core_echoverse import (
     tts_with_gtts_to_bytes,
 )
 
-# ---------- Page/setup ----------
 st.set_page_config(page_title="EchoVerse", page_icon="🎧", layout="wide")
 
-# ---------- Minimal DARK styles ----------
 st.markdown("""
 <style>
 :root{
@@ -135,7 +133,6 @@ c1, c2, c3 = st.columns([1,1,3])
 with c1:
     gen = st.button("Generate Audiobook")
 
-# ---------- State ----------
 if "rewritten" not in st.session_state:
     st.session_state.rewritten = ""
 if "audio_bytes" not in st.session_state:
@@ -148,7 +145,6 @@ if "last_meta" not in st.session_state:
 def _safe_name(s: str) -> str:
     return "".join(c for c in s if c.isalnum() or c in ("-","_")).strip("_")
 
-# ---------- Generate ----------
 if gen:
     if not text or not text.strip():
         st.warning("Please provide some input text (upload a .txt or paste text).")
