@@ -1,14 +1,17 @@
 # core_echoverse.py
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-import json
+import io
 import os
-import sys
-import textwrap
+import re
+import json
 import datetime
 from pathlib import Path
+import textwrap
 
-import requests
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 
 try:
     from gtts import gTTS
@@ -17,108 +20,160 @@ except Exception:
     _HAS_GTTS = False
 
 
+MODEL_ID = os.getenv("HF_MODEL_ID", "ibm-granite/granite-3.2-2b-instruct")
+
 DEFAULT_TONES = [
     "Neutral","Suspenseful","Inspiring","Joyful","Calm","Dramatic","Motivational",
     "Humorous","Serious","Urgent","Formal","Casual","Friendly","Authoritative",
     "Romantic","Cinematic","Narrative","Empathetic",
 ]
 
+
+# ---------- Files ----------
 def ensure_outputs_dir() -> Path:
-    out_dir = Path("outputs")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    return out_dir
+    out = Path("outputs")
+    out.mkdir(parents=True, exist_ok=True)
+    return out
 
 def save_text(text: str, tone: str) -> Path:
     ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    out_dir = ensure_outputs_dir()
-    safe_tone = "".join(c for c in tone if c.isalnum() or c in ("-", "_")).strip("_")
-    path = out_dir / f"rewritten_{safe_tone}_{ts}.txt"
-    path.write_text(text, encoding="utf-8")
-    return path
+    out = ensure_outputs_dir()
+    safe_tone = "".join(c for c in tone if c.isalnum() or c in ("-","_")).strip("_")
+    p = out / f"rewritten_{safe_tone}_{ts}.txt"
+    p.write_text(text, encoding="utf-8")
+    return p
 
-# ---------- Ollama helpers ----------
-def _ollama_models(base_url: str):
-    url = f"{base_url.rstrip('/')}/api/tags"
-    try:
-        r = requests.get(url, timeout=15)
-        if r.status_code != 200:
-            return []
-        data = r.json()
-        return [m.get("name") for m in data.get("models", []) if m.get("name")]
-    except requests.RequestException:
-        return []
 
-def ensure_model_present(model: str, base_url: str):
-    models = _ollama_models(base_url)
-    if model not in models:
-        msg = (
-            f"Ollama model '{model}' not found at {base_url}.\n"
-            f"To fix:\n"
-            f"  1) Ensure Ollama is running.\n"
-            f"  2) Pull the model:\n"
-            f"     ollama pull {model}\n"
-            f"Installed models: {', '.join(models) if models else '(none detected)'}"
+# ---------- LLM: Granite via Hugging Face ----------
+def _pick_device_map_and_dtype():
+    """
+    Decide device + dtype:
+      - CUDA: float16 (or 4-bit if bitsandbytes present and env says so)
+      - MPS (Apple Silicon): float16
+      - CPU: float32
+    """
+    use_4bit = os.getenv("HF_USE_4BIT", "false").lower() in ("1","true","yes")
+    if torch.cuda.is_available():
+        dtype = torch.float16
+        device_map = "auto"
+        quant = "4bit" if use_4bit else None
+        return device_map, dtype, quant
+    if torch.backends.mps.is_available():
+        return {"": "mps"}, torch.float16, None
+    return "cpu", torch.float32, None
+
+def load_hf_pipeline(model_id: str = MODEL_ID):
+    device_map, dtype, quant = _pick_device_map_and_dtype()
+    tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+
+    if quant == "4bit":
+        try:
+            from bitsandbytes import __version__ as _  # noqa: F401
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                load_in_4bit=True,
+                device_map=device_map,
+                torch_dtype=torch.float16,
+            )
+        except Exception:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                device_map=device_map,
+                torch_dtype=dtype,
+            )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            device_map=device_map,
+            torch_dtype=dtype,
         )
-        raise RuntimeError(msg)
 
-def rewrite_with_ollama(
-    text: str,
-    tone: str,
-    model: str = "gemma3:4b",
-    base_url: str = "http://localhost:11434",
-    temperature: float = 0.7,
-    max_tokens: int = 512,
-) -> str:
-    ensure_model_present(model, base_url)
-    url = f"{base_url.rstrip('/')}/api/generate"
-    prompt = textwrap.dedent(f"""
+    gen = pipeline(
+        "text-generation",
+        model=model,
+        tokenizer=tok,
+        device_map=device_map,
+        torch_dtype=dtype,
+    )
+    return gen
+
+def _compose_prompt(text: str, tone: str) -> str:
+    # Strong, explicit instruction to avoid any labels/fences
+    return textwrap.dedent(f"""
     You are a writing assistant.
 
     Task: Rewrite the user's text in a **{tone}** tone.
-    Rules:
+
+    Output rules (very important):
+    - Output ONLY the rewritten text content.
+    - DO NOT include any labels like "Rewritten:", "Rewritten text:", "Output:", etc.
+    - DO NOT include code fences, markers, or separators such as ``` or ---.
+    - DO NOT quote the text with leading/trailing quotation marks.
     - Preserve the original meaning and key facts.
     - Keep it clear and natural.
     - Maintain the original language (do NOT translate).
     - Use an appropriate register for the tone.
-    - Output ONLY the rewritten text—no preface, no quotes, no explanations.
 
     User text:
-    ---
     {text}
-    ---
     """).strip()
 
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "stream": False,
-        "options": {"temperature": temperature, "num_predict": max_tokens}
-    }
-# The 
-    try:
-        r = requests.post(url, json=payload, timeout=120)
-    except requests.RequestException as e:
-        raise RuntimeError(f"Failed to reach Ollama at {url}. Error: {e}")
+def _postprocess(s: str) -> str:
+    """
+    Remove any stray labels, fences, and wrapping quotes the model may add.
+    """
+    s = s.strip()
 
-    if r.status_code != 200:
-        if r.status_code == 404 and "not found" in r.text.lower():
-            raise RuntimeError(
-                f"Ollama says the model '{model}' is not found.\n"
-                f"Run:  ollama pull {model}\n"
-                f"Raw response: {r.text}"
-            )
-        raise RuntimeError(f"Ollama returned HTTP {r.status_code}: {r.text}")
+    # Remove triple-backtick code fences (start or end)
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z0-9]*\s*", "", s, flags=re.DOTALL)  # ``` or ```lang
+    s = re.sub(r"\s*```$", "", s)
 
-    data = r.json()
-    if "response" not in data:
-        raise RuntimeError(f"Unexpected Ollama response: {json.dumps(data)[:500]}")
-    return data["response"].strip()
+    # Remove leading "Rewritten text:", "Rewritten:", "Output:", "Answer:", "Response:", etc (case-insensitive)
+    s = re.sub(
+        r"^(?:rewritten(?:\s+text)?|output|answer|response|final|result)\s*:?\s*",
+        "",
+        s,
+        flags=re.IGNORECASE,
+    )
+
+    # Remove leading or trailing fence-like lines of --- — – or *** etc.
+    s = re.sub(r"^(?:[-–—*_`]{3,}\s*)+", "", s)
+    s = re.sub(r"(?:\s*[-–—*_`]{3,})+$", "", s)
+
+    # Clean common leading punctuation/noise
+    s = re.sub(r"^[>\-\–\—:\s]+", "", s)
+
+    # Strip matching surrounding quotes if the whole thing is quoted
+    if len(s) >= 2 and s[0] in "\"'“”‘’" and s[-1] in "\"'“”‘’":
+        s = s[1:-1].strip()
+
+    # Remove any leftover double newlines at the start/end
+    s = s.strip()
+
+    return s
+
+def rewrite_with_granite(pipe, text: str, tone: str,
+                         temperature: float = 0.7, max_new_tokens: int = 512) -> str:
+    prompt = _compose_prompt(text, tone)
+    out = pipe(
+        prompt,
+        do_sample=True,
+        temperature=float(temperature),
+        top_p=0.9,
+        repetition_penalty=1.05,
+        max_new_tokens=int(max_new_tokens),
+        return_full_text=False,  # just the continuation
+        eos_token_id=pipe.tokenizer.eos_token_id,
+    )
+    text_out = out[0]["generated_text"]
+    return _postprocess(text_out)
+
 
 # ---------- gTTS ----------
 def tts_with_gtts_to_bytes(text: str, lang: str = "en", tld: str = "com", slow: bool = False) -> bytes:
     if not _HAS_GTTS:
         raise RuntimeError("gTTS not installed. Install with: pip install gTTS")
-    import io
     buf = io.BytesIO()
     gTTS(text=text, lang=lang, tld=tld, slow=slow).write_to_fp(buf)
     return buf.getvalue()

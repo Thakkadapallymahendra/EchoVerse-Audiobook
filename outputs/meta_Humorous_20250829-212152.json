@@ -1,0 +1,10 @@
+{
+  "timestamp": "20250829-212152",
+  "tone": "Humorous",
+  "voice": "Kate (UK)",
+  "model": "ibm-granite/granite-3.2-2b-instruct",
+  "temperature": 0.7,
+  "max_new_tokens": 512,
+  "text_file": "outputs\\rewritten_Humorous_20250829-212152.txt",
+  "audio_file": "outputs\\speech_Humorous_20250829-212152.mp3"
+}
